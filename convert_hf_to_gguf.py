@@ -4949,12 +4949,13 @@ class Glm4VVisionModel(Qwen3VLVisionModel):
         yield from super().modify_tensors(data_torch, name, bid)
 
 
-@ModelBase.register("Qwen3VLForConditionalGeneration")
+@ModelBase.register("Qwen3VLForConditionalGeneration", "Qwen3VLForEmbedding")
 class Qwen3VLTextModel(Qwen3Model):
     model_arch = gguf.MODEL_ARCH.QWEN3VL
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
+        self.gguf_writer.add_pooling_type(gguf.PoolingType.LAST)
 
         # Handle MRoPE (Multi-axis Rotary Position Embedding) for Qwen3-VL
         vision_config = self.hparams.get("vision_config", {})

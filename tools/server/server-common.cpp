@@ -341,7 +341,7 @@ void server_tokens::push_back(llama_token tok) {
 
 void server_tokens::push_back(const mtmd_input_chunk * chunk) {
     auto type = mtmd_input_chunk_get_type(chunk);
-    if (type == MTMD_INPUT_CHUNK_TYPE_IMAGE || type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+    if (type == MTMD_INPUT_CHUNK_TYPE_IMAGE || type == MTMD_INPUT_CHUNK_TYPE_AUDIO || type == MTMD_INPUT_CHUNK_TYPE_VIDEO) {
         GGML_ASSERT(has_mtmd);
         const size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
         size_t start_idx = tokens.size();
@@ -517,8 +517,10 @@ int32_t server_tokens::process_chunk(
             int32_t seq_id,
             size_t & n_tokens_out) const {
     const auto & chunk = find_chunk(idx);
-    const char * name = mtmd_input_chunk_get_type(chunk.get()) == MTMD_INPUT_CHUNK_TYPE_IMAGE
-                        ? "image" : "audio";
+    const auto chunk_type = mtmd_input_chunk_get_type(chunk.get());
+    const char * name = chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE ? "image"
+                      : chunk_type == MTMD_INPUT_CHUNK_TYPE_VIDEO ? "video"
+                      : "audio";
     SRV_INF("processing %s...\n", name);
     int32_t n_batch = llama_n_batch(ctx);
     int64_t t0 = ggml_time_ms();
@@ -723,6 +725,47 @@ server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::
     }
     auto result = server_tokens(chunks, true);
     return result;
+}
+
+server_tokens process_mtmd_video_prompt(mtmd_context * mctx, std::string prompt, std::vector<raw_buffer> frame_files) {
+    // decode each frame file into a bitmap
+    mtmd::bitmaps bitmaps;
+    for (auto & file : frame_files) {
+        mtmd::bitmap bmp(mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size()));
+        if (!bmp.ptr) {
+            throw std::runtime_error("Failed to load video frame");
+        }
+        std::string hash = fnv_hash(bmp.data(), bmp.n_bytes());
+        bmp.set_id(hash.c_str());
+        bitmaps.entries.push_back(std::move(bmp));
+    }
+
+    // tokenize as video with temporal frame pairing
+    mtmd_input_text inp_txt = {
+        prompt.c_str(),
+        /* add_special */   true,
+        /* parse_special */ true,
+    };
+    mtmd::input_chunks chunks(mtmd_input_chunks_init());
+    auto bitmaps_c_ptr = bitmaps.c_ptr();
+    int32_t tokenized = mtmd_tokenize_video(mctx,
+                                            chunks.ptr.get(),
+                                            &inp_txt,
+                                            bitmaps_c_ptr.data(),
+                                            bitmaps_c_ptr.size());
+    if (tokenized != 0) {
+        throw std::runtime_error("Failed to tokenize video prompt");
+    }
+    return server_tokens(chunks, true);
+}
+
+server_tokens process_mtmd_video_frames_from_json(mtmd_context * mctx, const std::string & prompt, const json & json_frames) {
+    std::vector<raw_buffer> frame_files;
+    frame_files.reserve(json_frames.size());
+    for (const auto & f : json_frames) {
+        frame_files.push_back(base64_decode(f.at("image")));
+    }
+    return process_mtmd_video_prompt(mctx, prompt, std::move(frame_files));
 }
 
 /**

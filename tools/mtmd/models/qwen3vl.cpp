@@ -54,7 +54,7 @@ ggml_cgraph * clip_graph_qwen3vl::build() {
     GGML_ASSERT(img.ny % (patch_size * 2) == 0);
 
     {
-        auto inp_1 = ggml_conv_2d(ctx0, model.patch_embeddings_1, inp_raw, patch_size, patch_size, 0, 0, 1, 1);
+        auto inp_1 = ggml_conv_2d(ctx0, model.patch_embeddings_1, inp_raw_t1, patch_size, patch_size, 0, 0, 1, 1);
         inp = ggml_add(ctx0, inp, inp_1);
 
         inp = ggml_permute(ctx0, inp, 1, 2, 0, 3);

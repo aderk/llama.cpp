@@ -100,6 +100,7 @@ class ServerProcess:
     chat_template_file: str | None = None
     server_path: str | None = None
     mmproj_url: str | None = None
+    mmproj_file: str | None = None
     media_path: str | None = None
     sleep_idle_seconds: int | None = None
     webui_mcp_proxy: bool = False
@@ -233,6 +234,8 @@ class ServerProcess:
             server_args.extend(["--chat-template-file", self.chat_template_file])
         if self.mmproj_url:
             server_args.extend(["--mmproj-url", self.mmproj_url])
+        if self.mmproj_file:
+            server_args.extend(["--mmproj", self.mmproj_file])
         if self.media_path:
             server_args.extend(["--media-path", self.media_path])
         if self.sleep_idle_seconds is not None:
@@ -566,6 +569,20 @@ class ServerPreset:
         server.n_slots = 2
         server.n_predict = 4
         server.seed = 42
+        return server
+
+    @staticmethod
+    def qwen3vl_embedding() -> ServerProcess:
+        server = ServerProcess()
+        server.model_file = "models/qwen3-vl-embedding-2b-q8_0.gguf"
+        server.mmproj_file = "models/mmproj-qwen3-vl-embedding-2b-f16.gguf"
+        server.model_alias = "qwen3-vl-embedding"
+        server.n_ctx = 8192
+        server.n_batch = 2048
+        server.n_slots = 1
+        server.seed = 42
+        server.server_embeddings = True
+        server.pooling = "last"
         return server
 
     @staticmethod

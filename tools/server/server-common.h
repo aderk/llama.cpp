@@ -273,6 +273,20 @@ std::vector<server_tokens> tokenize_input_prompts(
                                         bool add_special,
                                         bool parse_special);
 
+// tokenize video frames into a prompt with VIDEO chunks for temporal frame pairing
+// frame_files contains the raw image data for each frame
+server_tokens process_mtmd_video_prompt(
+                                        mtmd_context * mctx,
+                                        std::string prompt,
+                                        std::vector<raw_buffer> frame_files);
+
+// decode base64-encoded video frames and tokenize with temporal frame pairing
+// json_frames is an array of {timestamp, image} objects
+server_tokens process_mtmd_video_frames_from_json(
+                                        mtmd_context * mctx,
+                                        const std::string & prompt,
+                                        const json & json_frames);
+
 //
 // OAI utils
 //

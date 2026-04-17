@@ -36,8 +36,10 @@ struct mtmd_bitmap {
 struct mtmd_image_tokens {
     uint32_t nx; // number of tokens in x direction
     uint32_t ny; // number of tokens in y direction
-    bool use_mrope_pos = false; // use M-RoPE position counting (the whole image is 1 temporal position)
-    uint32_t n_tokens() const { return nx * ny; }
+    uint32_t nt = 1; // number of temporal frame pairs (1 for single images)
+    bool use_mrope_pos = false; // use M-RoPE position counting
+    bool is_video = false; // true for video frame pairs, false for single images
+    uint32_t n_tokens() const { return nt * nx * ny; }
     clip_image_f32_batch batch_f32; // preprocessed image patches
     std::string id; // optional user-defined ID, useful for KV cache tracking
 
@@ -45,7 +47,9 @@ struct mtmd_image_tokens {
         return mtmd_image_tokens{
             nx,
             ny,
+            nt,
             use_mrope_pos,
+            is_video,
             batch_f32.clone(),
             id
         };
@@ -457,7 +461,7 @@ struct mtmd_context {
 
     // get clip ctx based on chunk type
     clip_ctx * get_clip_ctx(const mtmd_input_chunk * chunk) const {
-        if (chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+        if (chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE || chunk->type == MTMD_INPUT_CHUNK_TYPE_VIDEO) {
             return ctx_v;
         } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
             return ctx_a;
@@ -902,6 +906,124 @@ int32_t mtmd_tokenize(mtmd_context * ctx,
     return tokenizer.tokenize(output);
 }
 
+int32_t mtmd_tokenize_video(mtmd_context * ctx,
+                            mtmd_input_chunks * output,
+                            const mtmd_input_text * text,
+                            const mtmd_bitmap ** frames,
+                            size_t n_frames) {
+    if (!ctx->ctx_v) {
+        LOG_ERR("%s: model does not support vision input\n", __func__);
+        return 2;
+    }
+    if (n_frames == 0) {
+        LOG_ERR("%s: no frames provided\n", __func__);
+        return 2;
+    }
+
+    // group frames into temporal pairs (temporal_patch_size=2)
+    // if odd number, duplicate the last frame
+    size_t n_pairs = (n_frames + 1) / 2;
+
+    // preprocess each frame pair through the vision encoder's image preprocessor
+    // each pair produces one set of spatial tokens with the Conv3D-split encoding
+    std::vector<clip_image_f32_batch> pair_batches(n_pairs);
+    uint32_t tokens_nx = 0;
+    uint32_t tokens_ny = 0;
+
+    for (size_t p = 0; p < n_pairs; p++) {
+        size_t idx0 = p * 2;
+        size_t idx1 = (p * 2 + 1 < n_frames) ? p * 2 + 1 : idx0; // duplicate last if odd
+
+        // preprocess frame 0 of the pair
+        clip_image_u8_ptr img0(clip_image_u8_init());
+        img0->nx = frames[idx0]->nx;
+        img0->ny = frames[idx0]->ny;
+        img0->buf.resize(frames[idx0]->data.size());
+        std::memcpy(img0->buf.data(), frames[idx0]->data.data(), img0->nx * img0->ny * 3);
+
+        clip_image_f32_batch batch0;
+        if (!clip_image_preprocess(ctx->ctx_v, img0.get(), &batch0)) {
+            LOG_ERR("%s: failed to preprocess frame %zu\n", __func__, idx0);
+            return 2;
+        }
+
+        // preprocess frame 1 of the pair
+        clip_image_u8_ptr img1(clip_image_u8_init());
+        img1->nx = frames[idx1]->nx;
+        img1->ny = frames[idx1]->ny;
+        img1->buf.resize(frames[idx1]->data.size());
+        std::memcpy(img1->buf.data(), frames[idx1]->data.data(), img1->nx * img1->ny * 3);
+
+        clip_image_f32_batch batch1;
+        if (!clip_image_preprocess(ctx->ctx_v, img1.get(), &batch1)) {
+            LOG_ERR("%s: failed to preprocess frame %zu\n", __func__, idx1);
+            return 2;
+        }
+
+        // combine both frames into a single batch for the frame pair
+        // the vision encoder expects entries[0]=frame_t0, entries[1]=frame_t1
+        clip_image_f32_batch pair_batch;
+        GGML_ASSERT(!batch0.entries.empty());
+        GGML_ASSERT(!batch1.entries.empty());
+        pair_batch.entries.push_back(std::move(batch0.entries[0]));
+        pair_batch.entries.push_back(std::move(batch1.entries[0]));
+        pair_batches[p] = std::move(pair_batch);
+
+        // compute spatial token dimensions from the first pair
+        if (p == 0) {
+            tokens_nx = clip_n_output_tokens_x(ctx->ctx_v, pair_batches[0].entries[0].get());
+            tokens_ny = clip_n_output_tokens_y(ctx->ctx_v, pair_batches[0].entries[0].get());
+        }
+    }
+
+    // build the video chunk with all frame pairs
+    // use a single bitmap (the first frame) as the tokenizer's bitmap input
+    // so that text tokenization works normally with one media marker
+    mtmd_tokenizer tokenizer(ctx, text, frames, 1);
+
+    // first pass: tokenize with a single frame to get the text token structure
+    // then post-process to replace the IMAGE chunk with a VIDEO chunk
+    mtmd_input_chunks text_chunks;
+    int32_t res = tokenizer.tokenize(&text_chunks);
+    if (res != 0) {
+        return res;
+    }
+
+    // find the IMAGE chunk produced by the tokenizer and replace it with a VIDEO chunk
+    output->entries.clear();
+    for (auto & chunk : text_chunks.entries) {
+        if (chunk.type == MTMD_INPUT_CHUNK_TYPE_IMAGE && chunk.tokens_image) {
+            // replace the image chunk with a video chunk containing all frame pairs
+            mtmd_image_tokens_ptr video_tokens(new mtmd_image_tokens);
+            video_tokens->nx = tokens_nx;
+            video_tokens->ny = tokens_ny;
+            video_tokens->nt = n_pairs;
+            video_tokens->use_mrope_pos = mtmd_decode_use_mrope(ctx);
+            video_tokens->is_video = true;
+
+            // collect all frame pair batches into the video tokens
+            for (size_t p = 0; p < n_pairs; p++) {
+                for (auto & entry : pair_batches[p].entries) {
+                    video_tokens->batch_f32.entries.push_back(std::move(entry));
+                }
+            }
+            video_tokens->id = (frames[0]->id.empty()) ? "video" : frames[0]->id;
+
+            mtmd_input_chunk video_chunk{
+                MTMD_INPUT_CHUNK_TYPE_VIDEO,
+                {},
+                std::move(video_tokens),
+                nullptr,
+            };
+            output->entries.emplace_back(std::move(video_chunk));
+        } else {
+            output->entries.emplace_back(std::move(chunk));
+        }
+    }
+
+    return 0;
+}
+
 int32_t mtmd_encode_chunk(mtmd_context * ctx, const mtmd_input_chunk * chunk) {
     if (chunk->type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
         LOG_WRN("mtmd_encode_chunk has no effect for text chunks\n");
@@ -911,6 +1033,13 @@ int32_t mtmd_encode_chunk(mtmd_context * ctx, const mtmd_input_chunk * chunk) {
             LOG_ERR("%s: model does not support vision input\n", __func__);
             return 1;
         }
+        return mtmd_encode(ctx, chunk->tokens_image.get());
+    } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_VIDEO) {
+        if (!ctx->ctx_v) {
+            LOG_ERR("%s: model does not support vision input\n", __func__);
+            return 1;
+        }
+        // video chunks use the same vision encoder, encoding each frame pair separately
         return mtmd_encode(ctx, chunk->tokens_image.get());
     } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
         if (!ctx->ctx_a) {
@@ -929,6 +1058,60 @@ int32_t mtmd_encode_chunk(mtmd_context * ctx, const mtmd_input_chunk * chunk) {
 
     LOG_ERR("%s: unknown chunk type %d\n", __func__, (int)chunk->type);
     return 1;
+}
+
+int32_t mtmd_encode_video_chunk(mtmd_context * ctx,
+                                 const mtmd_input_chunk * chunk,
+                                 float * output_embd) {
+    if (chunk->type != MTMD_INPUT_CHUNK_TYPE_VIDEO) {
+        LOG_ERR("%s: chunk is not a VIDEO chunk\n", __func__);
+        return 1;
+    }
+    if (!ctx->ctx_v) {
+        LOG_ERR("%s: model does not support vision input\n", __func__);
+        return 1;
+    }
+
+    const auto * video_tokens = chunk->tokens_image.get();
+    const int nt = video_tokens->nt;
+    const int nx = video_tokens->nx;
+    const int ny = video_tokens->ny;
+    const int tokens_per_pair = nx * ny;
+    const int n_mmproj_embd = clip_n_mmproj_embd(ctx->ctx_v);
+
+    // Encode each frame pair through the vision encoder independently.
+    // Send both frames of the pair so Conv3D split works properly:
+    //   kernel_0 → entries[0] (frame t0)
+    //   kernel_1 → entries[1] (frame t1)
+    for (int t = 0; t < nt; t++) {
+        size_t batch_idx = t * 2;
+
+        clip_image_f32_batch pair_batch;
+        pair_batch.entries.emplace_back(new clip_image_f32(*video_tokens->batch_f32.entries[batch_idx]));
+        pair_batch.entries.emplace_back(new clip_image_f32(*video_tokens->batch_f32.entries[batch_idx + 1]));
+
+        mtmd_image_tokens pair_tokens;
+        pair_tokens.nx = nx;
+        pair_tokens.ny = ny;
+        pair_tokens.nt = 1;
+        pair_tokens.use_mrope_pos = video_tokens->use_mrope_pos;
+        pair_tokens.is_video = false;
+        pair_tokens.batch_f32 = std::move(pair_batch);
+
+        int32_t ret = mtmd_encode(ctx, &pair_tokens);
+        if (ret != 0) {
+            LOG_ERR("%s: failed to encode frame pair %d\n", __func__, t);
+            return ret;
+        }
+
+        float * embd = mtmd_get_output_embd(ctx);
+        std::memcpy(
+            output_embd + t * tokens_per_pair * n_mmproj_embd,
+            embd,
+            tokens_per_pair * n_mmproj_embd * sizeof(float));
+    }
+
+    return 0;
 }
 
 int32_t mtmd_encode(mtmd_context * ctx, const mtmd_image_tokens * image_tokens) {
@@ -1121,10 +1304,17 @@ const mtmd_image_tokens * mtmd_input_chunk_get_tokens_image(const mtmd_input_chu
     return nullptr;
 }
 
+const mtmd_image_tokens * mtmd_input_chunk_get_tokens_video(const mtmd_input_chunk * chunk) {
+    if (chunk->type == MTMD_INPUT_CHUNK_TYPE_VIDEO) {
+        return chunk->tokens_image.get();
+    }
+    return nullptr;
+}
+
 size_t mtmd_input_chunk_get_n_tokens(const mtmd_input_chunk * chunk) {
     if (chunk->type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
         return chunk->tokens_text.size();
-    } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+    } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE || chunk->type == MTMD_INPUT_CHUNK_TYPE_VIDEO) {
         return mtmd_image_tokens_get_n_tokens(chunk->tokens_image.get());
     } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
         return chunk->tokens_audio->n_tokens;
@@ -1136,7 +1326,7 @@ size_t mtmd_input_chunk_get_n_tokens(const mtmd_input_chunk * chunk) {
 llama_pos mtmd_input_chunk_get_n_pos(const mtmd_input_chunk * chunk) {
     if (chunk->type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
         return chunk->tokens_text.size();
-    } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+    } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE || chunk->type == MTMD_INPUT_CHUNK_TYPE_VIDEO) {
         return mtmd_image_tokens_get_n_pos(chunk->tokens_image.get());
     } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
         return chunk->tokens_audio->n_tokens;
@@ -1146,7 +1336,7 @@ llama_pos mtmd_input_chunk_get_n_pos(const mtmd_input_chunk * chunk) {
 }
 
 const char * mtmd_input_chunk_get_id(const mtmd_input_chunk * chunk) {
-    if (chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+    if (chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE || chunk->type == MTMD_INPUT_CHUNK_TYPE_VIDEO) {
         return chunk->tokens_image->id.c_str();
     } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
         return chunk->tokens_audio->id.c_str();
@@ -1194,15 +1384,18 @@ size_t mtmd_image_tokens_get_ny(const mtmd_image_tokens * image_tokens) {
     return image_tokens->ny;
 }
 
+size_t mtmd_image_tokens_get_nt(const mtmd_image_tokens * image_tokens) {
+    return image_tokens->nt;
+}
+
 const char * mtmd_image_tokens_get_id(const mtmd_image_tokens * image_tokens) {
     return image_tokens->id.c_str();
 }
 
 llama_pos mtmd_image_tokens_get_n_pos(const mtmd_image_tokens * image_tokens) {
     if (image_tokens->use_mrope_pos) {
-        // for M-RoPE, temporal dimension = max(t,h,w)
-        // t is omitted as we don't support video input
-        return std::max(image_tokens->nx, image_tokens->ny);
+        // for M-RoPE, the position count is max(t, h, w) across all dimensions
+        return std::max({image_tokens->nt, image_tokens->nx, image_tokens->ny});
     }
     return image_tokens->n_tokens();
 }

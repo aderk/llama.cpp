@@ -57,6 +57,7 @@ enum mtmd_input_chunk_type {
     MTMD_INPUT_CHUNK_TYPE_TEXT,
     MTMD_INPUT_CHUNK_TYPE_IMAGE,
     MTMD_INPUT_CHUNK_TYPE_AUDIO,
+    MTMD_INPUT_CHUNK_TYPE_VIDEO,
 };
 
 // opaque types
@@ -167,6 +168,7 @@ MTMD_API void                     mtmd_input_chunks_free(mtmd_input_chunks * chu
 MTMD_API enum mtmd_input_chunk_type mtmd_input_chunk_get_type        (const mtmd_input_chunk * chunk);
 MTMD_API const llama_token *        mtmd_input_chunk_get_tokens_text (const mtmd_input_chunk * chunk, size_t * n_tokens_output);
 MTMD_API const mtmd_image_tokens *  mtmd_input_chunk_get_tokens_image(const mtmd_input_chunk * chunk);
+MTMD_API const mtmd_image_tokens *  mtmd_input_chunk_get_tokens_video(const mtmd_input_chunk * chunk);
 MTMD_API size_t                     mtmd_input_chunk_get_n_tokens    (const mtmd_input_chunk * chunk);
 // returns nullptr for ID on text chunk
 MTMD_API const char *               mtmd_input_chunk_get_id          (const mtmd_input_chunk * chunk);
@@ -187,6 +189,7 @@ MTMD_API void               mtmd_input_chunk_free(mtmd_input_chunk * chunk);
 MTMD_API size_t       mtmd_image_tokens_get_n_tokens(const mtmd_image_tokens * image_tokens); // TODO: deprecate
 MTMD_API size_t       mtmd_image_tokens_get_nx      (const mtmd_image_tokens * image_tokens);
 MTMD_API size_t       mtmd_image_tokens_get_ny      (const mtmd_image_tokens * image_tokens);
+MTMD_API size_t       mtmd_image_tokens_get_nt      (const mtmd_image_tokens * image_tokens);
 MTMD_API const char * mtmd_image_tokens_get_id      (const mtmd_image_tokens * image_tokens); // TODO: deprecate
 // number of temporal positions (equals to max(t,h,w) for M-RoPE; equals to n_tokens otherwise)
 MTMD_API llama_pos    mtmd_image_tokens_get_n_pos   (const mtmd_image_tokens * image_tokens); // TODO: deprecate
@@ -213,6 +216,22 @@ MTMD_API int32_t mtmd_tokenize(mtmd_context * ctx,
                                const mtmd_bitmap ** bitmaps,
                                size_t n_bitmaps);
 
+// tokenize video frames into VIDEO chunks with temporal frame pairing
+// frames are grouped into pairs (temporal_patch_size=2):
+//   frames 0,1 → pair 0; frames 2,3 → pair 1; etc.
+// if odd number of frames, the last frame is duplicated to form a pair
+// the prompt must contain exactly one media marker for the video
+// this function is thread-safe (shared ctx)
+// return values:
+//   0 on success
+//   1 on invalid prompt (missing or multiple markers)
+//   2 on preprocessing error
+MTMD_API int32_t mtmd_tokenize_video(mtmd_context * ctx,
+                                     mtmd_input_chunks * output,
+                                     const mtmd_input_text * text,
+                                     const mtmd_bitmap ** frames,
+                                     size_t n_frames);
+
 // returns 0 on success
 // TODO: deprecate
 MTMD_API int32_t mtmd_encode(mtmd_context * ctx,
@@ -221,6 +240,13 @@ MTMD_API int32_t mtmd_encode(mtmd_context * ctx,
 // returns 0 on success
 MTMD_API int32_t mtmd_encode_chunk(mtmd_context * ctx,
                                    const mtmd_input_chunk * chunk);
+
+// encode a VIDEO chunk by processing each temporal frame pair independently
+// writes nt * nx * ny * n_embd_inp floats into output_embd (caller-allocated)
+// returns 0 on success
+MTMD_API int32_t mtmd_encode_video_chunk(mtmd_context * ctx,
+                                          const mtmd_input_chunk * chunk,
+                                          float * output_embd);
 
 // get output embeddings from the last encode pass
 // the reading size (in bytes) is equal to:

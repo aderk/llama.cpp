@@ -3863,6 +3863,104 @@ void server_routes::init_routes() {
         return handle_embeddings_impl(req, TASK_RESPONSE_TYPE_OAI_EMBD);
     };
 
+    this->post_embeddings_qwen3vl = [this](const server_http_req & req) {
+        auto res = create_response();
+        if (!params.embedding) {
+            res->error(format_error_response("This server does not support embeddings. Start it with `--embeddings`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        const json body = json::parse(req.body);
+
+        // if no video_frames field, delegate to standard OAI embeddings handler
+        if (!body.contains("video_frames")) {
+            return handle_embeddings_impl(req, TASK_RESPONSE_TYPE_OAI_EMBD);
+        }
+
+        // video embedding path
+        const auto & video_frames = body.at("video_frames");
+        if (!video_frames.is_array() || video_frames.empty()) {
+            res->error(format_error_response("\"video_frames\" must be a non-empty array", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        const size_t n_frames = video_frames.size();
+        if (n_frames > 30) {
+            res->error(format_error_response("Too many frames (max 30)", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        // validate frame structure
+        for (size_t i = 0; i < n_frames; i++) {
+            const auto & f = video_frames[i];
+            if (!f.contains("timestamp") || !f.contains("image")) {
+                res->error(format_error_response("Each video_frame must have \"timestamp\" and \"image\" fields", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+        }
+
+        const std::string instruction = json_value(body, "instruction", std::string(""));
+        int embd_normalize = json_value(body, "embd_normalize", 2);
+
+        // build prompt
+        std::string prompt;
+        if (!instruction.empty()) {
+            prompt = "<|im_start|>system\n" + instruction + "<|im_end|>\n";
+        }
+        prompt += "<|im_start|>user\n<__media__>\n<|im_end|>\n<|im_start|>assistant\n";
+
+        // tokenize all frames as one batch
+        server_tokens tokenized;
+        try {
+            tokenized = process_mtmd_video_frames_from_json(ctx_server.mctx, prompt, video_frames);
+        } catch (const std::exception & e) {
+            res->error(format_error_response(std::string("Video tokenization failed: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        // single embedding task
+        auto & rd = res->rd;
+        {
+            server_task task = server_task(SERVER_TASK_TYPE_EMBEDDING);
+            task.id     = rd.get_new_id();
+            task.tokens = std::move(tokenized);
+            task.params.res_type = TASK_RESPONSE_TYPE_OAI_EMBD;
+            task.params.embd_normalize = embd_normalize;
+            std::vector<server_task> tasks;
+            tasks.push_back(std::move(task));
+            rd.post_tasks(std::move(tasks));  // called exactly once
+        }
+
+        auto all_results = rd.wait_for_all(req.should_stop);
+        if (all_results.is_terminated) {
+            return res;
+        } else if (all_results.error) {
+            res->error(all_results.error->to_json());
+            return res;
+        }
+
+        // return standard OAI embedding format
+        auto & result = all_results.results[0];
+        json result_json = result->to_json();
+        auto embedding_vec = json_value(result_json, "embedding", std::vector<float>{});
+        int tokens_evaluated = json_value(result_json, "tokens_evaluated", 0);
+
+        json root = {
+            {"object", "list"},
+            {"model",  json_value(body, "model", meta->model_name)},
+            {"data",   json::array({
+                {{"object", "embedding"}, {"index", 0}, {"embedding", embedding_vec}}
+            })},
+            {"usage", {
+                {"prompt_tokens", tokens_evaluated},
+                {"total_tokens",  tokens_evaluated}
+            }}
+        };
+
+        res->ok(root);
+        return res;
+    };
+
     this->post_rerank = [this](const server_http_req & req) {
         auto res = create_response();
         if (!params.embedding || params.pooling_type != LLAMA_POOLING_TYPE_RANK) {

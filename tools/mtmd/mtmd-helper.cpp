@@ -193,6 +193,29 @@ struct decode_embd_batch {
         }
     }
 
+    // M-RoPE for video (temporal + spatial positioning)
+    // tokens are laid out as nt frame pairs, each with ny rows of nx tokens
+    void set_position_mrope_3d(llama_pos pos_0, int nt, int nx, int ny, llama_seq_id seq_id) {
+        GGML_ASSERT(n_pos_per_embd == 4);
+        seq_id_0[0] = seq_id;
+        for (int t = 0; t < nt; t++) {
+            for (int y = 0; y < ny; y++) {
+                for (int x = 0; x < nx; x++) {
+                    int i = t * nx * ny + y * nx + x;
+                    pos[i                     ] = pos_0 + t; // temporal
+                    pos[i + batch.n_tokens    ] = pos_0 + y; // height
+                    pos[i + batch.n_tokens * 2] = pos_0 + x; // width
+                    pos[i + batch.n_tokens * 3] = 0;         // unused
+                }
+            }
+        }
+        for (int i = 0; i < batch.n_tokens; i++) {
+            batch.n_seq_id[i] = 1;
+            batch.seq_id  [i] = seq_id_0.data();
+            batch.logits  [i] = false;
+        }
+    }
+
     llama_batch get_view(int offset, int n_tokens) {
         GGML_ASSERT(offset >= 0 && n_tokens > 0 && offset + n_tokens <= batch.n_tokens);
         llama_pos * pos_ptr;
@@ -240,9 +263,10 @@ int32_t mtmd_helper_decode_image_chunk(
         llama_pos * new_n_past) {
     GGML_ASSERT(n_batch > 0);
     auto chunk_type = mtmd_input_chunk_get_type(chunk);
-    const char * name = chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE ? "image" : "audio";
+    const char * name = chunk_type == MTMD_INPUT_CHUNK_TYPE_VIDEO ? "video"
+                      : chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE ? "image" : "audio";
     if (chunk_type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
-        LOG_ERR("failed to decode chunk: input chunk not of image/audio type\n");
+        LOG_ERR("failed to decode chunk: input chunk not of image/audio/video type\n");
         return -1;
     }
 
@@ -265,6 +289,16 @@ int32_t mtmd_helper_decode_image_chunk(
             const int nx = mtmd_image_tokens_get_nx(image_tokens);
             const int ny = mtmd_image_tokens_get_ny(image_tokens);
             batch_embd.set_position_mrope_2d(n_past, nx, ny, seq_id);
+        } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_VIDEO) {
+            const auto video_tokens = mtmd_input_chunk_get_tokens_video(chunk);
+            if (!video_tokens) {
+                LOG_ERR("failed to decode chunk: video tokens are null\n");
+                return -1;
+            }
+            const int nx = mtmd_image_tokens_get_nx(video_tokens);
+            const int ny = mtmd_image_tokens_get_ny(video_tokens);
+            const int nt = mtmd_image_tokens_get_nt(video_tokens);
+            batch_embd.set_position_mrope_3d(n_past, nt, nx, ny, seq_id);
         } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
             batch_embd.set_position_mrope_1d(n_past, seq_id);
         } else {
@@ -370,6 +404,39 @@ int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
         ret = mtmd_helper_decode_image_chunk(ctx, lctx, chunk, embd, n_past, seq_id, n_batch, new_n_past);
         if (ret != 0) {
             LOG_ERR("failed to decode %s\n", name);
+            llama_batch_free(text_batch);
+            return ret;
+        }
+    } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_VIDEO) {
+        // encode each frame pair through the vision encoder independently,
+        // then decode all embeddings together with 3D temporal M-RoPE positions
+        const auto * video_tokens = mtmd_input_chunk_get_tokens_video(chunk);
+        const int nt = mtmd_image_tokens_get_nt(video_tokens);
+        const int nx = mtmd_image_tokens_get_nx(video_tokens);
+        const int ny = mtmd_image_tokens_get_ny(video_tokens);
+        const int tokens_per_pair = nx * ny;
+        const int n_mmproj_embd = llama_model_n_embd_inp(llama_get_model(lctx));
+        const int total_tokens = nt * tokens_per_pair;
+
+        std::vector<float> all_embeddings(total_tokens * n_mmproj_embd);
+
+        int64_t t0 = ggml_time_ms();
+        LOG_INF("encoding video: %d frame pairs...\n", nt);
+
+        ret = mtmd_encode_video_chunk(ctx, chunk, all_embeddings.data());
+        if (ret != 0) {
+            LOG_ERR("failed to encode video\n");
+            llama_batch_free(text_batch);
+            return ret;
+        }
+
+        LOG_INF("video encoded in %" PRId64 " ms\n", ggml_time_ms() - t0);
+
+        // decode all frame pair embeddings together with 3D M-RoPE
+        ret = mtmd_helper_decode_image_chunk(ctx, lctx, chunk, all_embeddings.data(),
+                                              n_past, seq_id, n_batch, new_n_past);
+        if (ret != 0) {
+            LOG_ERR("failed to decode video\n");
             llama_batch_free(text_batch);
             return ret;
         }

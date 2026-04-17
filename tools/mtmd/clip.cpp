@@ -954,7 +954,12 @@ ggml_tensor * clip_graph::build_patch_merge_permute(ggml_tensor * cur, int scale
 }
 
 static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32_batch & imgs) {
-    GGML_ASSERT(imgs.entries.size() == 1 && "n_batch > 1 is not supported");
+    GGML_ASSERT(imgs.entries.size() >= 1);
+    if (ctx->proj_type() != PROJECTOR_TYPE_QWEN3VL) {
+        GGML_ASSERT(imgs.entries.size() == 1 && "n_batch > 1 is not supported for this projector");
+    } else {
+        GGML_ASSERT(imgs.entries.size() <= 2 && "Qwen3VL supports at most 2 frames (temporal pair)");
+    }
 
     const clip_image_f32 & img = *imgs.entries[0];
     std::unique_ptr<clip_graph> builder;
@@ -2256,20 +2261,32 @@ struct clip_model_loader {
     };
 
     static void warmup(clip_ctx & ctx_clip) {
-        // create a fake batch
         const auto & hparams = ctx_clip.model.hparams;
         clip_image_f32_batch batch;
-        clip_image_f32_ptr img(clip_image_f32_init());
-        if (ctx_clip.model.modality == CLIP_MODALITY_VISION) {
-            img->nx = hparams.warmup_image_size;
-            img->ny = hparams.warmup_image_size;
-            LOG_INF("%s: warmup with image size = %d x %d\n", __func__, img->nx, img->ny);
-        } else {
-            img->nx = hparams.warmup_audio_size;
-            img->ny = hparams.n_mel_bins;
-            LOG_INF("%s: warmup with audio size = %d\n", __func__, img->nx);
+
+        // Qwen3VL Conv3D needs 2-entry batch (temporal frame pair) for correct graph shape;
+        // warmup must reserve buffers for the max graph size to avoid Metal heap corruption
+        const int warmup_n = (ctx_clip.proj_type() == PROJECTOR_TYPE_QWEN3VL) ? 2 : 1;
+
+        for (int i = 0; i < warmup_n; i++) {
+            clip_image_f32_ptr img(clip_image_f32_init());
+            if (ctx_clip.model.modality == CLIP_MODALITY_VISION) {
+                img->nx = hparams.warmup_image_size;
+                img->ny = hparams.warmup_image_size;
+            } else {
+                img->nx = hparams.warmup_audio_size;
+                img->ny = hparams.n_mel_bins;
+            }
+            batch.entries.push_back(std::move(img));
         }
-        batch.entries.push_back(std::move(img));
+
+        if (ctx_clip.model.modality == CLIP_MODALITY_VISION) {
+            LOG_INF("%s: warmup with image size = %d x %d, batch_size = %d\n",
+                    __func__, hparams.warmup_image_size, hparams.warmup_image_size, warmup_n);
+        } else {
+            LOG_INF("%s: warmup with audio size = %d\n", __func__, hparams.warmup_audio_size);
+        }
+
         warmup(ctx_clip, batch);
     }
 
@@ -4392,10 +4409,9 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
     const clip_image_f32_batch & imgs = *imgs_c_ptr;
     int batch_size = imgs.entries.size();
 
-    // TODO @ngxson : implement batch size > 1 as a loop
-    //                we don't need true batching support because the cgraph will gonna be big anyway
-    if (batch_size != 1) {
-        return false; // only support batch size of 1
+    // batch_size == 1 for single images, == 2 for video frame pairs (temporal_patch_size=2)
+    if (batch_size != 1 && batch_size != 2) {
+        return false;
     }
 
     // if buffers are not allocated, we need to do a warmup run to allocate them
@@ -4454,11 +4470,9 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
 
     // set input pixel values
     if (!imgs.is_audio) {
-        size_t nelem = 0;
-        for (const auto & img : imgs.entries) {
-            nelem += img->nx * img->ny * 3;
-        }
-        std::vector<float> inp_raw(nelem);
+        const int nx = imgs.entries[0]->nx;
+        const int ny = imgs.entries[0]->ny;
+        const int n = nx * ny;
 
         // layout of data (note: the channel dim is unrolled to better visualize the layout):
         //
@@ -4469,24 +4483,39 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         // ├─────┤ │
         // │     H │  channel = B
         // └─────┘ │
-        //   ──────┘ x B
 
-        for (size_t i = 0; i < imgs.entries.size(); i++) {
-            const int nx = imgs.entries[i]->nx;
-            const int ny = imgs.entries[i]->ny;
+        // convert from interleaved RGB to planar layout for frame 0
+        auto planarize = [](const clip_image_f32 & img) {
+            const int nx = img.nx;
+            const int ny = img.ny;
             const int n = nx * ny;
-
-            for (int b = 0; b < batch_size; b++) {
-                float * batch_entry = inp_raw.data() + b * (3*n);
-                for (int y = 0; y < ny; y++) {
-                    for (int x = 0; x < nx; x++) {
-                        size_t base_src = 3*(y * nx + x); // idx of the first channel
-                        size_t base_dst =    y * nx + x;  // idx of the first channel
-                        batch_entry[      base_dst] = imgs.entries[b]->buf[base_src    ];
-                        batch_entry[1*n + base_dst] = imgs.entries[b]->buf[base_src + 1];
-                        batch_entry[2*n + base_dst] = imgs.entries[b]->buf[base_src + 2];
-                    }
+            std::vector<float> planar(3 * n);
+            for (int y = 0; y < ny; y++) {
+                for (int x = 0; x < nx; x++) {
+                    size_t base_src = 3*(y * nx + x);
+                    size_t base_dst =    y * nx + x;
+                    planar[      base_dst] = img.buf[base_src    ];
+                    planar[1*n + base_dst] = img.buf[base_src + 1];
+                    planar[2*n + base_dst] = img.buf[base_src + 2];
                 }
+            }
+            return planar;
+        };
+
+        std::vector<float> inp_raw_t0 = planarize(*imgs.entries[0]);
+        set_input_f32("inp_raw", inp_raw_t0);
+
+        // if the graph has a second temporal input tensor, set it
+        // for video frame pairs: entries[1] is the second temporal frame
+        // for single images: duplicate frame 0 into both temporal slots
+        ggml_tensor * inp_raw_t1_tensor = ggml_graph_get_tensor(gf, "inp_raw_t1");
+        if (inp_raw_t1_tensor != nullptr) {
+            if (batch_size >= 2) {
+                std::vector<float> inp_raw_t1 = planarize(*imgs.entries[1]);
+                ggml_backend_tensor_set(inp_raw_t1_tensor, inp_raw_t1.data(), 0, ggml_nbytes(inp_raw_t1_tensor));
+            } else {
+                // single image: duplicate frame 0 into both temporal inputs
+                ggml_backend_tensor_set(inp_raw_t1_tensor, inp_raw_t0.data(), 0, ggml_nbytes(inp_raw_t1_tensor));
             }
         }
         if (ggml_graph_get_tensor(gf, "inp_raw") != nullptr) {

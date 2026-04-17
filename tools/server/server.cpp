@@ -152,6 +152,7 @@ int main(int argc, char ** argv) {
         routes.post_infill                 = models_routes->proxy_post;
         routes.post_embeddings             = models_routes->proxy_post;
         routes.post_embeddings_oai         = models_routes->proxy_post;
+        routes.post_embeddings_qwen3vl     = models_routes->proxy_post;
         routes.post_rerank                 = models_routes->proxy_post;
         routes.post_tokenize               = models_routes->proxy_post;
         routes.post_detokenize             = models_routes->proxy_post;
@@ -191,6 +192,7 @@ int main(int argc, char ** argv) {
     ctx_http.post("/embedding",           ex_wrapper(routes.post_embeddings)); // legacy
     ctx_http.post("/embeddings",          ex_wrapper(routes.post_embeddings));
     ctx_http.post("/v1/embeddings",       ex_wrapper(routes.post_embeddings_oai));
+    ctx_http.post("/experimental/qwen3vlembeddings", ex_wrapper(routes.post_embeddings_qwen3vl));
     ctx_http.post("/rerank",              ex_wrapper(routes.post_rerank));
     ctx_http.post("/reranking",           ex_wrapper(routes.post_rerank));
     ctx_http.post("/v1/rerank",           ex_wrapper(routes.post_rerank));
