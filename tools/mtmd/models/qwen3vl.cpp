@@ -48,6 +48,11 @@ ggml_cgraph * clip_graph_qwen3vl::build() {
     ggml_tensor * inp_raw = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, img.nx, img.ny, 3, batch_size);
     ggml_set_name(inp_raw, "inp_raw");
     ggml_set_input(inp_raw);
+
+    ggml_tensor * inp_raw_t1 = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, img.nx, img.ny, 3, batch_size);
+    ggml_set_name(inp_raw_t1, "inp_raw_t1");
+    ggml_set_input(inp_raw_t1);
+
     ggml_tensor * inp = ggml_conv_2d(ctx0, model.patch_embeddings_0, inp_raw, patch_size, patch_size, 0, 0, 1, 1);
 
     GGML_ASSERT(img.nx % (patch_size * 2) == 0);

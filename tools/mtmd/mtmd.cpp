@@ -942,7 +942,7 @@ int32_t mtmd_tokenize_video(mtmd_context * ctx,
         std::memcpy(img0->buf.data(), frames[idx0]->data.data(), img0->nx * img0->ny * 3);
 
         clip_image_f32_batch batch0;
-        if (!clip_image_preprocess(ctx->ctx_v, img0.get(), &batch0)) {
+        if (!ctx->image_preproc->preprocess(*img0, batch0)) {
             LOG_ERR("%s: failed to preprocess frame %zu\n", __func__, idx0);
             return 2;
         }
@@ -955,7 +955,7 @@ int32_t mtmd_tokenize_video(mtmd_context * ctx,
         std::memcpy(img1->buf.data(), frames[idx1]->data.data(), img1->nx * img1->ny * 3);
 
         clip_image_f32_batch batch1;
-        if (!clip_image_preprocess(ctx->ctx_v, img1.get(), &batch1)) {
+        if (!ctx->image_preproc->preprocess(*img1, batch1)) {
             LOG_ERR("%s: failed to preprocess frame %zu\n", __func__, idx1);
             return 2;
         }

@@ -4518,10 +4518,6 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
                 ggml_backend_tensor_set(inp_raw_t1_tensor, inp_raw_t0.data(), 0, ggml_nbytes(inp_raw_t1_tensor));
             }
         }
-        if (ggml_graph_get_tensor(gf, "inp_raw") != nullptr) {
-            set_input_f32("inp_raw", inp_raw);
-        }
-
         if (ctx->model.proj_type == PROJECTOR_TYPE_QWEN3VL) {
             const int merge_ratio = hparams.n_merge;
             const int pw = image_size_width  / patch_size;
